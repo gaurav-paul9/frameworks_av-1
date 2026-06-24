@@ -31,11 +31,13 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <poll.h>
+#include <vector>
 
 #include <android/hardware/ICamera.h>
 #include <android/hardware/ICameraClient.h>
 
 #include <aidl/AidlCameraService.h>
+#include <android-base/file.h>
 #include <android-base/macros.h>
 #include <android-base/parseint.h>
 #include <android-base/properties.h>
@@ -100,6 +102,111 @@
 #ifdef CAMERA_NEEDS_CLIENT_INFO_LIB_OPLUS
 #include <vendor/oplus/hardware/cameraMDM/2.0/IOPlusCameraMDM.h>
 #endif
+
+// Inject OPlus vendor tag values into camera characteristics.
+// Reads CameraHWConfiguration.config and populates supported.cameraid.type,
+// custom.jpeg.size, SensorName, and mSensorName tags that chi.override
+// cannot populate due to encrypted oplus_camera_config.
+static void injectOplusVendorTags(const std::string& cameraId,
+        CameraMetadata* cameraInfo) {
+    if (cameraInfo == nullptr) return;
+
+    const char* kConfigPath = "/odm/etc/camera/CameraHWConfiguration.config";
+    std::string configContent;
+    if (!android::base::ReadFileToString(kConfigPath, &configContent)) {
+        ALOGW("injectOplusVendorTags: could not read %s", kConfigPath);
+        return;
+    }
+
+    bool inOemCameraTypeMap = false;
+    bool inSensorNameList = false;
+    std::vector<int> cameraTypes;
+    std::vector<std::string> sensorNames;
+
+    std::vector<std::string> lines = android::base::Split(configContent, "\n");
+    for (const auto& line : lines) {
+        std::string l = line;
+        // Trim trailing whitespace
+        size_t end = l.find_last_not_of(" \t\r");
+        if (end != std::string::npos) l.erase(end + 1);
+        if (l.empty()) continue;
+
+        if (l == "[OemCameraTypeMap]") {
+            inOemCameraTypeMap = true;
+            inSensorNameList = false;
+            continue;
+        }
+        if (l == "[SensorNameList]") {
+            inOemCameraTypeMap = false;
+            inSensorNameList = true;
+            continue;
+        }
+        if (l[0] == '#') continue;
+        if (l[0] == '[') {
+            inOemCameraTypeMap = false;
+            inSensorNameList = false;
+            continue;
+        }
+
+        if (inOemCameraTypeMap) {
+            size_t eqPos = l.find('=');
+            if (eqPos == std::string::npos) continue;
+            std::string val = l.substr(eqPos + 1);
+            size_t semiPos = val.find(';');
+            if (semiPos == std::string::npos) continue;
+            std::string typeStr = val.substr(semiPos + 1);
+            typeStr.erase(0, typeStr.find_first_not_of(" \t"));
+            end = typeStr.find_last_not_of(" \t");
+            if (end != std::string::npos) typeStr.erase(end + 1);
+            int ct = std::atoi(typeStr.c_str());
+            cameraTypes.push_back(ct);
+        }
+
+        if (inSensorNameList) {
+            size_t eqPos = l.find('=');
+            if (eqPos == std::string::npos) continue;
+            std::string name = l.substr(eqPos + 1);
+            name.erase(0, name.find_first_not_of(" \t"));
+            end = name.find_last_not_of(" \t");
+            if (end != std::string::npos) name.erase(end + 1);
+            if (!name.empty()) sensorNames.push_back(name);
+        }
+    }
+
+    char* endPtr = nullptr;
+    int modeIdx = strtol(cameraId.c_str(), &endPtr, 10);
+    if (endPtr == cameraId.c_str() || modeIdx < 0 || modeIdx >= (int)cameraTypes.size()) {
+        ALOGW("injectOplusVendorTags: cam %s idx %d out of range (%zu types)",
+              cameraId.c_str(), modeIdx, cameraTypes.size());
+        return;
+    }
+
+    int ct = cameraTypes[modeIdx];
+    std::string sn = modeIdx < (int)sensorNames.size() ? sensorNames[modeIdx] : "";
+
+    ALOGI("oplus tag inject: cam=%s idx=%d type=%d sensor=%s",
+          cameraId.c_str(), modeIdx, ct, sn.c_str());
+
+    // supported.cameraid.type (0x80d90014, TYPE_INT32)
+    int32_t v = ct;
+    if (cameraInfo->update(0x80d90014, &v, 1) != OK)
+        ALOGE("oplus inject: failed supported.cameraid.type");
+
+    // custom.jpeg.size (0x80d90016, TYPE_INT32)
+    int32_t jsz = 1;
+    if (cameraInfo->update(0x80d90016, &jsz, 1) != OK)
+        ALOGE("oplus inject: failed custom.jpeg.size");
+
+    // SensorName (0x80da0056, TYPE_BYTE)
+    if (!sn.empty()) {
+        std::vector<uint8_t> nb(sn.begin(), sn.end());
+        nb.push_back('\0');
+        if (cameraInfo->update(0x80da0056, nb.data(), nb.size()) != OK)
+            ALOGE("oplus inject: failed SensorName");
+        if (cameraInfo->update(0x80da0060, nb.data(), nb.size()) != OK)
+            ALOGE("oplus inject: failed mSensorName");
+    }
+}
 
 namespace {
     const char* kActivityServiceName = "activity";
@@ -1408,6 +1515,8 @@ Status CameraService::getCameraCharacteristics(const std::string& unresolvedCame
                     strerror(-res), res);
         }
     }
+
+    injectOplusVendorTags(cameraId, cameraInfo);
 
     return filterSensitiveMetadataIfNeeded(cameraId, cameraInfo);
 }
